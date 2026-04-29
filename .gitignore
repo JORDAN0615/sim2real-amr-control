@@ -1,0 +1,37 @@
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local/editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs and generated artifacts
+*.log
+*.tmp
+*.bak
+
+# ROS/colcon build outputs if created locally
+build/
+install/
+log/
+
+# Large simulation/recording artifacts
+*.bag
+*.db3
+*.mcap
