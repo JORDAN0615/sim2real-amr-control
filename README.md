@@ -18,9 +18,7 @@ YOLO-World 3D object detection
 
 The demo shows Isaac Sim publishing perception topics, the ROS 2 controller selecting a visual target, and the AMR moving through `/cmd_vel`.
 
-<video src="assets/demo.mp4" controls width="100%"></video>
-
-If the embedded player does not load, open [assets/demo.mp4](assets/demo.mp4).
+[Watch the demo video](./assets/demo.mp4)
 
 ## What This Shows
 
