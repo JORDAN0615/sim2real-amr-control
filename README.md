@@ -20,8 +20,6 @@ The demo shows Isaac Sim publishing perception topics, the ROS 2 controller sele
 
 ![AMR demo](./assets/amr.gif)
 
-[Watch the demo video](./assets/demo.mp4)
-
 YOLO-ROS / YOLO-World object detection debug view:
 
 ![YOLO-ROS detection result](./assets/yolo.png)
