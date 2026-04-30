@@ -22,6 +22,10 @@ The demo shows Isaac Sim publishing perception topics, the ROS 2 controller sele
 
 [Watch the demo video](./assets/demo.mp4)
 
+YOLO-ROS / YOLO-World object detection debug view:
+
+![YOLO-ROS detection result](./assets/yolo.png)
+
 ## What This Shows
 
 - Visual servo style AMR control in Isaac Sim through normal ROS 2 topics.
