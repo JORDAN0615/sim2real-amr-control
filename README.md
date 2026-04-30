@@ -1,17 +1,17 @@
 # Sim2Real AMR Control
 
-This repository contains small ROS 2 controllers for a visual-target AMR demo in Isaac Sim. The main idea is to let an agent issue a high-level command such as "go to the forklift" or "go to tag 0", while a deterministic ROS script handles the short control loop and publishes `/cmd_vel`.
+This repository contains a ROS 2 prototype for agent-controlled AMR movement in Isaac Sim. The main idea is to let an agent issue a high-level command such as "go to the yellow forklift", while a deterministic ROS script handles the motion loop and publishes `/cmd_vel`.
 
-The project currently supports two target sources:
+The current demo focuses on this workflow:
 
 ```text
-AprilTag
-  Isaac Sim camera -> isaac_ros_apriltag -> /tag_detections or /tf
-  -> ros2_move_to_tag.py -> /cmd_vel
-
-YOLO-World 3D object detection
-  Isaac Sim RGB/depth camera -> yolo_ros -> /yolo/detections_3d
-  -> ros2_move_to_object.py -> /cmd_vel
+Isaac Sim AMR scene
+  -> simulated camera publishes rectified RGB image + depth image + camera info
+  -> yolo_ros / YOLO-World detects semantic objects
+  -> yolo_ros combines detection + depth into /yolo/detections_3d
+  -> agent selects the target object class
+  -> ros2_move_to_object.py converts target xyz into /cmd_vel
+  -> AMR drives toward the selected object and stops at a configured distance
 ```
 
 ## Demo
@@ -24,13 +24,17 @@ YOLO-ROS / YOLO-World object detection debug view:
 
 ![YOLO-ROS detection result](./assets/yolo.png)
 
-## What This Shows
+## Project Workflow
 
-- Visual servo style AMR control in Isaac Sim through normal ROS 2 topics.
-- AprilTag-based navigation using NVIDIA Isaac ROS AprilTag.
-- Semantic object navigation using YOLO-World, depth, and `yolo_ros`.
-- A simple agent-friendly interface: choose a tag ID or object class, then run one command.
-- A reusable sim-to-real direction: the controller only depends on ROS topics, so the perception source can later move from Isaac Sim cameras to real sensors.
+1. Isaac Sim runs the AMR scene and publishes camera data through ROS 2.
+2. The camera provides rectified RGB, depth, and camera calibration topics.
+3. `yolo_ros` runs YOLO-World on the RGB image and uses depth to produce 3D object detections.
+4. `/yolo/detections_3d` contains each detected object's class name, score, and 3D position in `base_link`.
+5. The agent chooses a semantic target, for example `yellow forklift` or `orange barrel`.
+6. `ros2_move_to_object.py` reads the selected object's 3D position, computes forward and turning velocity, and publishes `/cmd_vel`.
+7. The AMR keeps moving until it reaches the configured stop distance or loses the target.
+
+The same control interface can later be reused for a real AMR if the real system publishes equivalent ROS 2 camera, depth, detection, and `/cmd_vel` topics.
 
 ## Repository Contents
 
@@ -55,43 +59,12 @@ skills/
 
 - ROS 2 Humble.
 - Isaac Sim publishing camera, TF, odometry, and `/cmd_vel` topics.
-- NVIDIA Isaac ROS AprilTag for AprilTag navigation.
 - `yolo_ros` with YOLO-World support for semantic object navigation.
 - A mobile base or simulated AMR that accepts `geometry_msgs/msg/Twist` on `/cmd_vel`.
 
 The scripts were developed against an Isaac ROS dev container workflow, but the code itself is plain ROS 2 Python.
 
-## AprilTag Control
-
-Start the Isaac ROS AprilTag pipeline:
-
-```bash
-ros2 launch isaac_ros_apriltag isaac_ros_apriltag_isaac_sim_pipeline.launch.py
-```
-
-Run the controller with `/tag_detections`:
-
-```bash
-python3 ros2_move_to_tag.py --ros-args \
-  -p pose_source:=detections \
-  -p detections_topic:=/tag_detections \
-  -p tag_id:=0 \
-  -p cmd_vel_topic:=/cmd_vel \
-  -p speed:=0.50 \
-  -p stop_distance:=3.0 \
-  -p tag_timeout_sec:=2.0 \
-  -p debug:=true
-```
-
-Demo tag mapping:
-
-```text
-tag_id 0 = forklift
-tag_id 5 = brown cardboard box
-tag_id 2 = orange barrel
-```
-
-## YOLO-World Object Control
+## Runtime Topics
 
 The YOLO path expects RGB, depth, and camera info from Isaac Sim:
 
@@ -101,28 +74,15 @@ The YOLO path expects RGB, depth, and camera info from Isaac Sim:
 /front_stereo_camera/left/camera_info
 ```
 
-Launch YOLO-World with 3D detection enabled:
+`yolo_ros` publishes the 3D object stream used by the controller:
 
-```bash
-ros2 launch yolo_bringup yolo-world.launch.py \
-  input_image_topic:=/front_stereo_camera/left/image_rect_color \
-  input_depth_topic:=/front_stereo_camera/left/depth \
-  input_depth_info_topic:=/front_stereo_camera/left/camera_info \
-  target_frame:=base_link \
-  depth_image_units_divisor:=1 \
-  use_3d:=True \
-  use_tracking:=False \
-  use_debug:=True
+```text
+/yolo/detections_3d
 ```
 
-Set the YOLO-World prompt classes:
+## Example Agent Action
 
-```bash
-ros2 service call /yolo/set_classes yolo_msgs/srv/SetClasses \
-  "{classes: ['yellow forklift', 'cardboard box', 'orange barrel', 'blue barrel']}"
-```
-
-Move toward a selected object class:
+When the agent decides to move to a detected object, it only needs to call the controller with the selected class name:
 
 ```bash
 python3 ros2_move_to_object.py --ros-args \
@@ -136,9 +96,11 @@ python3 ros2_move_to_object.py --ros-args \
   -p debug:=true
 ```
 
+This is the main function-call style interface for the demo. The agent decides the target; the ROS node handles continuous velocity publishing.
+
 ## Control Logic
 
-Both controllers convert perception output into the same two variables:
+The controller converts the selected detection into two control variables:
 
 ```text
 forward = target distance in front of the AMR
