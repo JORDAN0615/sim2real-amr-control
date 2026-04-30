@@ -36,25 +36,6 @@ YOLO-ROS / YOLO-World object detection debug view:
 
 The same control interface can later be reused for a real AMR if the real system publishes equivalent ROS 2 camera, depth, detection, and `/cmd_vel` topics.
 
-## Repository Contents
-
-```text
-ros2_move_to_tag.py
-  Move the AMR toward a selected AprilTag ID.
-
-ros2_move_to_object.py
-  Move the AMR toward a selected YOLO-World class name from /yolo/detections_3d.
-
-yolo_move_to_object.md
-  Development notes for the YOLO 3D object-control pipeline.
-
-project.md
-  Current progress, design notes, and next-step TODOs.
-
-skills/
-  Agent-facing operation guides for AprilTag and YOLO-World AMR control.
-```
-
 ## Requirements
 
 - ROS 2 Humble.
