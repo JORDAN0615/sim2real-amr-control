@@ -10,6 +10,8 @@ only from front-camera detections in base_link.
 from dataclasses import dataclass
 import math
 from enum import Enum
+import os
+import sys
 
 import rclpy
 from geometry_msgs.msg import Twist
@@ -124,6 +126,8 @@ class MultiCameraObjectMissionNode(Node):
         self.last_front_acquire_received_ns = None
         self.last_front_seen_at = None
         self.done = False
+        self.exit_code = 0
+        self.shutdown_timer = None
         self.step_count = 0
         self.selected_camera = None
         self.saw_any_valid_target = False
@@ -440,10 +444,17 @@ class MultiCameraObjectMissionNode(Node):
             return
         if message.startswith("failed"):
             self.transition_to(MissionState.FAILED)
+            self.exit_code = 1
+        else:
+            self.exit_code = 0
         self.done = True
         self.stop_robot()
         self.get_logger().info(message)
-        rclpy.shutdown()
+        self.shutdown_timer = self.create_timer(0.1, self.force_exit)
+
+    def force_exit(self):
+        """Hard exit so the scheduler can observe a finished mission process."""
+        os._exit(self.exit_code)
 
     def log_debug_state(self, cmd, front, left, right):
         """Print compact telemetry every 10 control ticks when debug is enabled."""
@@ -476,15 +487,20 @@ def main():
     """ROS 2 entry point."""
     rclpy.init()
     node = None
+    exit_code = 0
     try:
         node = MultiCameraObjectMissionNode()
         rclpy.spin(node)
     except KeyboardInterrupt:
+        exit_code = 130
         if node is not None and rclpy.ok():
             node.stop_robot()
     finally:
+        if node is not None:
+            exit_code = node.exit_code if exit_code == 0 else exit_code
         if rclpy.ok():
             rclpy.shutdown()
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":

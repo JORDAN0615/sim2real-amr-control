@@ -12,19 +12,37 @@ set -euo pipefail
 export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-23}"
 
 pids=()
+cleaned_up=0
 
 cleanup() {
+  local status=$?
+  if [[ "${cleaned_up}" -eq 1 ]]; then
+    exit "${status}"
+  fi
+  cleaned_up=1
+  trap - INT TERM HUP EXIT
+
   echo
   echo "Stopping YOLO-World launch processes..."
   for pid in "${pids[@]}"; do
     if kill -0 "$pid" 2>/dev/null; then
-      kill "$pid" 2>/dev/null || true
+      kill -INT "$pid" 2>/dev/null || true
     fi
   done
-  wait 2>/dev/null || true
+
+  sleep 3
+
+  for pid in "${pids[@]}"; do
+    if kill -0 "$pid" 2>/dev/null; then
+      kill -TERM "$pid" 2>/dev/null || true
+    fi
+  done
+
+  wait "${pids[@]}" 2>/dev/null || true
+  exit "${status}"
 }
 
-trap cleanup INT TERM EXIT
+trap cleanup INT TERM HUP EXIT
 
 launch_yolo() {
   local namespace="$1"
