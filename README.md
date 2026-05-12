@@ -79,6 +79,68 @@ python3 ros2_move_to_object.py --ros-args \
 
 This is the main function-call style interface for the demo. The agent decides the target; the ROS node handles continuous velocity publishing.
 
+## Multi-Camera Demo Loop
+
+The multi-camera demo now separates mission execution from mission scheduling:
+
+```text
+demo_loop_runner
+  -> publishes mission command JSON
+multi_camera_object_mission
+  -> executes one active mission
+  -> publishes structured mission status JSON
+```
+
+For launch-based operation, build/source the package and run:
+
+```bash
+./launch_three_yolo_world.sh
+./set_multi_yolo_classes.sh
+ros2 launch apriltag_amr mission_demo.launch.py
+```
+
+`set_multi_yolo_classes.sh` defaults to the current demo loop priority classes:
+
+```text
+person
+traffic cone
+grey barrel
+blue barrel
+```
+
+Override them by passing class names explicitly:
+
+```bash
+./set_multi_yolo_classes.sh "person" "traffic cone" "grey barrel" "blue barrel"
+```
+
+The launch file starts `multi_camera_object_mission` with `auto_start:=false`, so it waits for `demo_loop_runner` to publish a command on:
+
+```text
+/multi_camera_object_mission/command
+```
+
+Manual mission command example:
+
+```bash
+ros2 topic pub --once /multi_camera_object_mission/command std_msgs/msg/String \
+  "{data: '{\"target_class_name\": \"person\"}'}"
+```
+
+Mission status is published as JSON on:
+
+```text
+/multi_camera_object_mission/status
+```
+
+For one-shot script compatibility, run the mission node with `auto_start:=true`:
+
+```bash
+python3 multi_camera_object_mission.py --ros-args \
+  -p auto_start:=true \
+  -p target_class_name:="person"
+```
+
 ## Control Logic
 
 The controller converts the selected detection into two control variables:

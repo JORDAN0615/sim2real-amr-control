@@ -1,0 +1,52 @@
+multi_camera_object_mission:
+  ros__parameters:
+    auto_start: false
+    front_detections_topic: /yolo_front/detections_3d
+    left_detections_topic: /yolo_left/detections_3d
+    right_detections_topic: /yolo_right/detections_3d
+    back_detections_topic: /yolo_back/detections_3d
+    target_frame: base_link
+    cmd_vel_topic: /cmd_vel
+    mission_command_topic: /multi_camera_object_mission/command
+    mission_cancel_topic: /multi_camera_object_mission/cancel
+    mission_status_topic: /multi_camera_object_mission/status
+    speed: 10.0
+    turn_speed: 3.0
+    angular_gain: 1.5
+    max_angular_z: 0.4
+    rotate_in_place_angle_rad: 0.35
+    angle_tolerance_rad: 0.02
+    stop_distance: 2.0
+    distance_tolerance: 0.04
+    mission_timeout_sec: 300.0
+    detection_timeout_sec: 8.0
+    front_acquire_timeout_sec: 30.0
+    front_acquire_required_ticks: 1
+    min_detection_score: 0.1
+    min_target_distance: 0.2
+    max_target_distance: 20.0
+    control_rate_hz: 20.0
+    status_publish_rate_hz: 1.0
+    debug: false
+
+demo_loop_runner:
+  ros__parameters:
+    priority_targets: person,traffic cone,grey barrel,blue barrel
+    front_detections_topic: /yolo_front/detections_3d
+    left_detections_topic: /yolo_left/detections_3d
+    right_detections_topic: /yolo_right/detections_3d
+    back_detections_topic: /yolo_back/detections_3d
+    target_frame: base_link
+    min_visible_score: 0.1
+    min_visible_distance: 0.2
+    max_visible_distance: 20.0
+    visible_detection_timeout_sec: 8.0
+    poll_interval_sec: 2.0
+    pause_between_missions_sec: 30.0
+    target_cooldown_sec: 0.0
+    pause_flag_file: /tmp/demo_loop_pause
+    mission_command_topic: /multi_camera_object_mission/command
+    mission_cancel_topic: /multi_camera_object_mission/cancel
+    mission_status_topic: /multi_camera_object_mission/status
+    log_file: demo_loop_runner.log
+    status_log_interval_sec: 10.0

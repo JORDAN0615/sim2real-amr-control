@@ -4,23 +4,22 @@
 from dataclasses import dataclass
 from datetime import datetime
 import argparse
-import math
+import json
 import os
-import subprocess
-import sys
 import time
 
+from mission_logic import (
+    DEFAULT_PRIORITY_TARGETS,
+    is_distance_visible,
+    parse_targets,
+    planar_distance,
+    prune_stale_targets,
+    select_priority_target,
+)
 import rclpy
 from rclpy.node import Node
+from std_msgs.msg import String
 from yolo_msgs.msg import DetectionArray
-
-
-DEFAULT_PRIORITY_TARGETS = [
-    "person",
-    "traffic cone",
-    "grey barrel",
-    "blue barrel",
-]
 
 
 @dataclass
@@ -40,12 +39,32 @@ class DemoLoopRunner(Node):
     def __init__(self, args):
         super().__init__("demo_loop_runner")
         self.args = args
+        self.apply_ros_parameters()
         self.priority_targets = parse_targets(args.priority_targets)
         self.cooldown_until = {}
         self.visible_targets = {}
         self.last_status_log_sec = 0.0
+        self.mission_active = False
+        self.active_target = None
+        self.last_mission_result = None
 
         self.log_file = open(args.log_file, "a", encoding="utf-8")
+        self.mission_command_pub = self.create_publisher(
+            String,
+            args.mission_command_topic,
+            10,
+        )
+        self.mission_cancel_pub = self.create_publisher(
+            String,
+            args.mission_cancel_topic,
+            10,
+        )
+        self.mission_status_sub = self.create_subscription(
+            String,
+            args.mission_status_topic,
+            self.on_mission_status,
+            10,
+        )
 
         self.detection_subscriptions = [
             self.create_subscription(
@@ -66,6 +85,12 @@ class DemoLoopRunner(Node):
                 lambda msg: self.on_detections("right", msg),
                 10,
             ),
+            self.create_subscription(
+                DetectionArray,
+                args.back_detections_topic,
+                lambda msg: self.on_detections("back", msg),
+                10,
+            ),
         ]
 
         self.write_log(
@@ -73,6 +98,46 @@ class DemoLoopRunner(Node):
             f"priority_targets={self.priority_targets} "
             f"pause_flag={args.pause_flag_file}"
         )
+
+    def apply_ros_parameters(self):
+        """Let launch/parameter YAML override CLI defaults for runner settings."""
+        parameter_defaults = {
+            "priority_targets": self.args.priority_targets,
+            "front_detections_topic": self.args.front_detections_topic,
+            "left_detections_topic": self.args.left_detections_topic,
+            "right_detections_topic": self.args.right_detections_topic,
+            "back_detections_topic": self.args.back_detections_topic,
+            "target_frame": self.args.target_frame,
+            "min_visible_score": self.args.min_visible_score,
+            "min_visible_distance": self.args.min_visible_distance,
+            "max_visible_distance": self.args.max_visible_distance,
+            "visible_detection_timeout_sec": self.args.visible_detection_timeout_sec,
+            "poll_interval_sec": self.args.poll_interval_sec,
+            "pause_between_missions_sec": self.args.pause_between_missions_sec,
+            "target_cooldown_sec": self.args.target_cooldown_sec,
+            "pause_flag_file": self.args.pause_flag_file,
+            "mission_command_topic": self.args.mission_command_topic,
+            "mission_cancel_topic": self.args.mission_cancel_topic,
+            "mission_status_topic": self.args.mission_status_topic,
+            "log_file": self.args.log_file,
+            "status_log_interval_sec": self.args.status_log_interval_sec,
+        }
+        for name, default in parameter_defaults.items():
+            self.declare_parameter(name, default)
+            setattr(self.args, name, self.get_parameter(name).value)
+
+    def on_mission_status(self, msg):
+        """Track structured mission controller status."""
+        try:
+            status = json.loads(msg.data)
+        except json.JSONDecodeError:
+            self.write_log(f"ignored invalid mission status: {msg.data!r}")
+            return
+
+        self.mission_active = bool(status.get("active", False))
+        if status.get("terminal"):
+            self.last_mission_result = status
+            self.mission_active = False
 
     def on_detections(self, camera, msg):
         """Cache latest visible detections from one camera topic."""
@@ -92,7 +157,7 @@ class DemoLoopRunner(Node):
                 # 相機名稱
                 camera=camera,
                 score=float(detection.score),
-                distance=math.hypot(float(position.x), float(position.y)),
+                distance=planar_distance(position),
                 received_at_sec=now_sec,
             )
             current = self.visible_targets.get(class_name)
@@ -107,14 +172,19 @@ class DemoLoopRunner(Node):
             return False
 
         position = detection.bbox3d.center.position
-        distance = math.hypot(float(position.x), float(position.y))
-        return self.args.min_visible_distance <= distance <= self.args.max_visible_distance
+        distance = planar_distance(position)
+        return is_distance_visible(
+            distance,
+            self.args.min_visible_distance,
+            self.args.max_visible_distance,
+        )
 
     def run_forever(self):
         """Main scheduler loop."""
         try:
             while rclpy.ok():
-                rclpy.spin_once() (self, timeout_sec=0.1)
+                # 檢查是否有新的 detection，讓 ROS2 node 處理一次 callback
+                rclpy.spin_once(self, timeout_sec=0.1)
                 self.prune_stale_targets()
                 # 檢查是否需要等待
                 reason = self.next_wait_reason()
@@ -131,7 +201,8 @@ class DemoLoopRunner(Node):
                     time.sleep(self.args.poll_interval_sec)
                     continue
                 
-                exit_code = self.launch_mission(target)
+                result = self.launch_mission(target)
+                result_code = result.get("result_code", "unknown")
                 if self.args.target_cooldown_sec > 0.0:
                     self.cooldown_until[target.class_name] = (
                         time.time() + self.args.target_cooldown_sec
@@ -139,108 +210,102 @@ class DemoLoopRunner(Node):
                     self.write_log(
                         f"cooldown target={target.class_name!r} "
                         f"until={format_epoch(self.cooldown_until[target.class_name])} "
-                        f"mission_exit_code={exit_code}"
+                        f"mission_result={result_code}"
                     )
                 else:
                     self.write_log(
                         f"cooldown disabled target={target.class_name!r} "
-                        f"mission_exit_code={exit_code}"
+                        f"mission_result={result_code}"
                     )
                 time.sleep(self.args.pause_between_missions_sec)
         finally:
+            if self.mission_active:
+                self.cancel_active_mission("demo loop shutting down")
             self.log_file.close()
     # 
     def prune_stale_targets(self):
         now_sec = self.get_clock().now().nanoseconds / 1e9
-        stale = [
-            class_name
-            for class_name, target in self.visible_targets.items()
-            if now_sec - target.received_at_sec > self.args.visible_detection_timeout_sec
-        ]
-        for class_name in stale:
-            del self.visible_targets[class_name]
+        self.visible_targets = prune_stale_targets(
+            self.visible_targets,
+            now_sec,
+            self.args.visible_detection_timeout_sec,
+        )
 
     def next_wait_reason(self):
         # 如果 pause_flag_file 存在，則返回 pause flag present: /tmp/demo_loop_pause
         if os.path.exists(self.args.pause_flag_file):
             return f"pause flag present: {self.args.pause_flag_file}"
-        # 如果 external_mission_running() 為 True，則返回 mission process already running
-        if external_mission_running():
-            return "mission process already running"
+        if self.mission_active:
+            return "mission already active"
         return None
 
     def select_target(self):
         now = time.time()
         visible_names = set(self.visible_targets)
-        cooling = []
-        # 如果 class_name 不在 visible_names 中，則跳過
-        for class_name in self.priority_targets:
-            if class_name not in visible_names:
-                continue
-            cooldown_until = self.cooldown_until.get(class_name, 0.0)
-            # 如果 cooldown_until 大於 now，則跳過
-            if cooldown_until > now:
-                cooling.append(f"{class_name} until {format_epoch(cooldown_until)}")
-                continue
-            # 回傳目前 class_name 的 VisibleTarget
-            return self.visible_targets[class_name]
+        target, cooling = select_priority_target(
+            self.priority_targets,
+            self.visible_targets,
+            self.cooldown_until,
+            now,
+        )
+        if target is not None:
+            return target
 
         if visible_names and cooling:
-            self.log_wait_reason("visible targets cooling down: " + ", ".join(cooling))
+            cooling_text = ", ".join(
+                f"{class_name} until {format_epoch(cooldown_until)}"
+                for class_name, cooldown_until in cooling
+            )
+            self.log_wait_reason("visible targets cooling down: " + cooling_text)
         return None
 
     def launch_mission(self, target):
-        command = [
-            sys.executable,
-            self.args.mission_script,
-            "--ros-args",
-            "-p",
-            f"target_class_name:={target.class_name}",
-        ]
+        command = {
+            "target_class_name": target.class_name,
+            "selected_camera": target.camera,
+            "score": target.score,
+            "distance": target.distance,
+        }
         self.write_log(
             f"launching target={target.class_name!r} camera={target.camera} "
             f"score={target.score:.3f} distance={target.distance:.3f} "
-            f"command={' '.join(command)}"
+            f"command_topic={self.args.mission_command_topic}"
         )
-        # 用目前 Python interpreter 執行 multi_camera_object_mission.py
-        process = subprocess.Popen(
-            command,
-            # 把 child 的輸出接回來
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-        )
-        self.write_log(f"mission_pid={process.pid}")
-        terminal_seen = False
-        assert process.stdout is not None
-        for line in process.stdout:
-            print(line, end="", flush=True)
-            # 看到 success: 或 failed: scheduler 就知道這個 mission 已經到 terminal stage
-            if "success:" in line or "failed:" in line:
-                terminal_seen = True
-                break
-        # 當terminal_seen 為 True 且 process.poll() is None 等 2 秒後強制關掉 process
-        if terminal_seen and process.poll() is None:
-            try:
-                process.wait(timeout=self.args.mission_exit_grace_sec)
-            except subprocess.TimeoutExpired:
+        self.active_target = target
+        self.last_mission_result = None
+        self.mission_active = True
+
+        msg = String()
+        msg.data = json.dumps(command, sort_keys=True)
+        self.mission_command_pub.publish(msg)
+
+        while rclpy.ok():
+            rclpy.spin_once(self, timeout_sec=0.1)
+            if self.last_mission_result is not None:
+                result = self.last_mission_result
                 self.write_log(
-                    f"mission_terminal_log_seen pid={process.pid}; terminating stuck process"
+                    f"mission_finished target={target.class_name!r} "
+                    f"result={result.get('result_code')} "
+                    f"message={result.get('message')!r}"
                 )
-                process.terminate()
-                try:
-                    process.wait(timeout=2.0)
-                except subprocess.TimeoutExpired:
-                    self.write_log(f"mission_pid={process.pid} did not terminate; killing")
-                    process.kill()
-                    process.wait()
-        else:
-            process.wait()
-        # 取得 process 的 exit code
-        exit_code = process.returncode
-        self.write_log(f"mission_finished target={target.class_name!r} exit_code={exit_code}")
-        return exit_code
+                self.active_target = None
+                return result
+            time.sleep(self.args.poll_interval_sec)
+
+        return {
+            "result_code": "interrupted",
+            "message": "rclpy stopped before mission result",
+            "target_class_name": target.class_name,
+        }
+
+    def cancel_active_mission(self, reason):
+        """Ask the mission controller to stop the active goal."""
+        if not self.mission_active:
+            return
+        msg = String()
+        msg.data = reason
+        self.mission_cancel_pub.publish(msg)
+        self.write_log(f"cancel_requested reason={reason!r}")
 
     def log_wait_reason(self, reason):
         now = time.time()
@@ -256,39 +321,6 @@ class DemoLoopRunner(Node):
         self.log_file.write(line + "\n")
         self.log_file.flush()
 
-# 轉成 Python list, ["person", "traffic cone", "grey barrel", "blue barrel"]
-def parse_targets(raw_targets):
-    if isinstance(raw_targets, list):
-        return raw_targets
-    targets = [target.strip() for target in raw_targets.split(",") if target.strip()]
-    return targets or DEFAULT_PRIORITY_TARGETS
-
-
-def external_mission_running():
-    current_pid = os.getpid()
-    try:
-        result = subprocess.run(
-            ["pgrep", "-af", "multi_camera_object_mission.py"],
-            check=False,
-            text=True,
-            capture_output=True,
-        )
-    except FileNotFoundError:
-        return False
-
-    for line in result.stdout.splitlines():
-        parts = line.split(maxsplit=1)
-        if not parts:
-            continue
-        try:
-            pid = int(parts[0])
-        except ValueError:
-            continue
-        if pid != current_pid:
-            return True
-    return False
-
-
 def format_epoch(epoch_seconds):
     return datetime.fromtimestamp(epoch_seconds).isoformat(timespec="seconds")
 
@@ -303,6 +335,7 @@ def build_parser():
     parser.add_argument("--front-detections-topic", default="/yolo_front/detections_3d")
     parser.add_argument("--left-detections-topic", default="/yolo_left/detections_3d")
     parser.add_argument("--right-detections-topic", default="/yolo_right/detections_3d")
+    parser.add_argument("--back-detections-topic", default="/yolo_back/detections_3d")
     parser.add_argument("--target-frame", default="base_link")
     parser.add_argument("--min-visible-score", type=float, default=0.1)
     parser.add_argument("--min-visible-distance", type=float, default=0.2)
@@ -312,15 +345,16 @@ def build_parser():
     parser.add_argument("--pause-between-missions-sec", type=float, default=30.0)
     parser.add_argument("--target-cooldown-sec", type=float, default=0.0)
     parser.add_argument("--pause-flag-file", default="/tmp/demo_loop_pause")
-    parser.add_argument("--mission-script", default="multi_camera_object_mission.py")
-    parser.add_argument("--mission-exit-grace-sec", type=float, default=2.0)
+    parser.add_argument("--mission-command-topic", default="/multi_camera_object_mission/command")
+    parser.add_argument("--mission-cancel-topic", default="/multi_camera_object_mission/cancel")
+    parser.add_argument("--mission-status-topic", default="/multi_camera_object_mission/status")
     parser.add_argument("--log-file", default="demo_loop_runner.log")
     parser.add_argument("--status-log-interval-sec", type=float, default=10.0)
     return parser
 
 
 def main():
-    args = build_parser().parse_args()
+    args, _ = build_parser().parse_known_args()
     rclpy.init()
     runner = DemoLoopRunner(args)
     try:

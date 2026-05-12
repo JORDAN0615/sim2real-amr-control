@@ -1,38 +1,52 @@
 #!/usr/bin/env python3
-"""Three-camera YOLO 3D object mission controller.
+"""Four-camera YOLO 3D object mission controller.
 
-This one-shot ROS 2 node subscribes to front, left, and right yolo_ros
-DetectionArray topics. Side cameras are used only to decide which way to turn
+This one-shot ROS 2 node subscribes to front, left, right, and back yolo_ros
+DetectionArray topics. Non-front cameras are used only to decide which way to turn
 until the front camera acquires the requested class. Approach is controlled
 only from front-camera detections in base_link.
 """
 
 from dataclasses import dataclass
+import json
 import math
 from enum import Enum
-import os
 import sys
 
 import rclpy
 from geometry_msgs.msg import Twist
+from mission_logic import clamp, planar_distance, select_acquisition_candidate
 from rclpy.node import Node
+from std_msgs.msg import String
 from yolo_msgs.msg import DetectionArray
-
-
-def clamp(value, lower, upper):
-    """Limit a numeric command to a safe min/max range."""
-    return max(lower, min(value, upper))
 
 
 class MissionState(str, Enum):
     """Controller states for the one-shot mission."""
 
+    IDLE = "IDLE"
     SEARCH = "SEARCH"
     TURN_LEFT_TO_ACQUIRE_FRONT = "TURN_LEFT_TO_ACQUIRE_FRONT"
     TURN_RIGHT_TO_ACQUIRE_FRONT = "TURN_RIGHT_TO_ACQUIRE_FRONT"
     FRONT_APPROACH = "FRONT_APPROACH"
     ARRIVED = "ARRIVED"
     FAILED = "FAILED"
+    CANCELED = "CANCELED"
+
+
+class MissionResultCode(str, Enum):
+    """Machine-readable terminal mission outcomes."""
+
+    IDLE = "idle"
+    RUNNING = "running"
+    SUCCEEDED = "succeeded"
+    MISSION_TIMEOUT = "mission_timeout"
+    NO_TARGET = "no_target"
+    FRONT_ACQUIRE_TIMEOUT = "front_acquire_timeout"
+    TARGET_LOST = "target_lost"
+    INVALID_FRAME = "invalid_frame"
+    REJECTED = "rejected"
+    CANCELED = "canceled"
 
 
 @dataclass
@@ -63,6 +77,7 @@ class MultiCameraObjectMissionNode(Node):
                 ("front_detections_topic", "/yolo_front/detections_3d"),
                 ("left_detections_topic", "/yolo_left/detections_3d"),
                 ("right_detections_topic", "/yolo_right/detections_3d"),
+                ("back_detections_topic", "/yolo_back/detections_3d"),
                 ("target_frame", "base_link"),
                 ("cmd_vel_topic", "/cmd_vel"),
                 ("speed", 10.0),
@@ -82,6 +97,11 @@ class MultiCameraObjectMissionNode(Node):
                 ("max_target_distance", 20.0),
                 ("control_rate_hz", 20.0),
                 ("debug", False),
+                ("auto_start", False),
+                ("mission_command_topic", "/multi_camera_object_mission/command"),
+                ("mission_cancel_topic", "/multi_camera_object_mission/cancel"),
+                ("mission_status_topic", "/multi_camera_object_mission/status"),
+                ("status_publish_rate_hz", 1.0),
             ],
         )
 
@@ -96,6 +116,7 @@ class MultiCameraObjectMissionNode(Node):
             "front": None,
             "left": None,
             "right": None,
+            "back": None,
         }
 
         self.detection_subscriptions = [
@@ -117,23 +138,54 @@ class MultiCameraObjectMissionNode(Node):
                 lambda msg: self.on_detections("right", msg),
                 10,
             ),
+            self.create_subscription(
+                DetectionArray,
+                self.get_parameter("back_detections_topic").value,
+                lambda msg: self.on_detections("back", msg),
+                10,
+            ),
         ]
 
-        self.state = MissionState.SEARCH
+        self.status_pub = self.create_publisher(
+            String,
+            self.get_parameter("mission_status_topic").value,
+            10,
+        )
+        self.command_sub = self.create_subscription(
+            String,
+            self.get_parameter("mission_command_topic").value,
+            self.on_mission_command,
+            10,
+        )
+        self.cancel_sub = self.create_subscription(
+            String,
+            self.get_parameter("mission_cancel_topic").value,
+            self.on_mission_cancel,
+            10,
+        )
+
+        self.state = MissionState.IDLE
         self.started_at = self.get_clock().now()
         self.state_entered_at = self.started_at
+        self.goal_started_at = None
         self.front_seen_count = 0
         self.last_front_acquire_received_ns = None
         self.last_front_seen_at = None
-        self.done = False
+        self.done = True
+        self.mission_active = False
         self.exit_code = 0
-        self.shutdown_timer = None
         self.step_count = 0
         self.selected_camera = None
         self.saw_any_valid_target = False
+        self.last_result = None
 
         control_rate_hz = float(self.get_parameter("control_rate_hz").value)
         self.timer = self.create_timer(1.0 / control_rate_hz, self.control_step)
+        status_publish_rate_hz = float(self.get_parameter("status_publish_rate_hz").value)
+        self.status_timer = self.create_timer(
+            1.0 / status_publish_rate_hz,
+            self.publish_current_status,
+        )
 
         self.get_logger().info(
             "multi_camera_object_mission started: "
@@ -141,8 +193,94 @@ class MultiCameraObjectMissionNode(Node):
             f"front={self.get_parameter('front_detections_topic').value}, "
             f"left={self.get_parameter('left_detections_topic').value}, "
             f"right={self.get_parameter('right_detections_topic').value}, "
+            f"back={self.get_parameter('back_detections_topic').value}, "
             f"target_frame={self.target_frame}, cmd_vel={cmd_vel_topic}"
         )
+        if bool(self.get_parameter("auto_start").value):
+            self.start_mission(self.target_class_name)
+        else:
+            self.publish_status("idle", MissionResultCode.SUCCEEDED, "waiting for mission command")
+
+    def on_mission_command(self, msg):
+        """Start a mission from a ROS-native command message.
+
+        The temporary command protocol accepts either a raw target-class string
+        or JSON like {"target_class_name": "person"}. It can be replaced by a
+        generated ROS action without changing the controller state machine.
+        """
+        target_class_name = msg.data.strip()
+        if not target_class_name:
+            self.publish_status(
+                "rejected",
+                MissionResultCode.REJECTED,
+                "empty mission command",
+                terminal=True,
+            )
+            return
+        try:
+            payload = json.loads(target_class_name)
+        except json.JSONDecodeError:
+            payload = {"target_class_name": target_class_name}
+
+        target_class_name = str(payload.get("target_class_name", "")).strip()
+        if not target_class_name:
+            self.publish_status(
+                "rejected",
+                MissionResultCode.REJECTED,
+                "mission command missing target_class_name",
+                terminal=True,
+            )
+            return
+        self.start_mission(target_class_name)
+
+    def on_mission_cancel(self, msg):
+        """Cancel the active mission when a runner/operator requests stop."""
+        if not self.mission_active:
+            self.publish_status("idle", MissionResultCode.CANCELED, "no active mission to cancel")
+            return
+        reason = msg.data.strip() or "mission canceled"
+        self.transition_to(MissionState.CANCELED)
+        self.finish(reason, MissionResultCode.CANCELED)
+
+    def start_mission(self, target_class_name):
+        """Reset per-mission state and begin searching for the requested class."""
+        if self.mission_active:
+            self.publish_status(
+                "rejected",
+                MissionResultCode.REJECTED,
+                f"mission already active for {self.target_class_name!r}",
+                terminal=True,
+            )
+            return False
+
+        self.target_class_name = target_class_name
+        self.reset_mission_state()
+        self.mission_active = True
+        self.done = False
+        self.transition_to(MissionState.SEARCH)
+        self.publish_status("accepted", MissionResultCode.SUCCEEDED, "mission accepted")
+        self.get_logger().info(f"mission accepted: target_class_name={target_class_name!r}")
+        return True
+
+    def reset_mission_state(self):
+        """Clear all state that must not leak between mission goals."""
+        now = self.get_clock().now()
+        self.latest_candidates = {
+            "front": None,
+            "left": None,
+            "right": None,
+            "back": None,
+        }
+        self.started_at = now
+        self.state_entered_at = now
+        self.goal_started_at = now
+        self.front_seen_count = 0
+        self.last_front_acquire_received_ns = None
+        self.last_front_seen_at = None
+        self.step_count = 0
+        self.selected_camera = None
+        self.saw_any_valid_target = False
+        self.last_result = None
 
     def validate_parameters(self):
         """Fail early on parameters that would make the mission unsafe."""
@@ -155,6 +293,7 @@ class MultiCameraObjectMissionNode(Node):
             "detection_timeout_sec",
             "front_acquire_timeout_sec",
             "control_rate_hz",
+            "status_publish_rate_hz",
         ]
         for name in numeric_positive:
             if float(self.get_parameter(name).value) <= 0.0:
@@ -173,6 +312,9 @@ class MultiCameraObjectMissionNode(Node):
 
     def on_detections(self, camera, msg):
         """Cache the nearest valid target-class detection from one camera."""
+        if not self.mission_active:
+            return
+
         now = self.get_clock().now()
         selected = None
 
@@ -184,7 +326,8 @@ class MultiCameraObjectMissionNode(Node):
             if frame_id != self.target_frame:
                 self.finish(
                     "failed: unexpected detection frame "
-                    f"camera={camera} frame={frame_id!r}; expected {self.target_frame!r}"
+                    f"camera={camera} frame={frame_id!r}; expected {self.target_frame!r}",
+                    MissionResultCode.INVALID_FRAME,
                 )
                 return
 
@@ -204,12 +347,12 @@ class MultiCameraObjectMissionNode(Node):
         score = float(detection.score)
         x = float(position.x)
         y = float(position.y)
-        distance = math.hypot(x, y)
+        distance = planar_distance(position)
 
         if score < float(self.get_parameter("min_detection_score").value):
             return None
         # Front detections drive approach, so they must be in front of base_link.
-        # Side detections only trigger heading acquisition and may appear with
+        # Non-front detections only trigger heading acquisition and may appear with
         # x <= 0 depending on side-camera placement and base_link origin.
         if camera == "front" and x <= 0.0:
             return None
@@ -231,14 +374,17 @@ class MultiCameraObjectMissionNode(Node):
 
     def control_step(self):
         """Run one deterministic control tick."""
-        if self.done:
+        if not self.mission_active or self.done:
             return
 
         if self.mission_timed_out():
             if self.saw_any_valid_target:
-                self.finish("failed: mission timeout")
+                self.finish("failed: mission timeout", MissionResultCode.MISSION_TIMEOUT)
             else:
-                self.finish("failed: no target detected before mission timeout")
+                self.finish(
+                    "failed: no target detected before mission timeout",
+                    MissionResultCode.NO_TARGET,
+                )
             return
 
         if self.state == MissionState.SEARCH:
@@ -255,6 +401,7 @@ class MultiCameraObjectMissionNode(Node):
         front = self.fresh_candidate("front")
         left = self.fresh_candidate("left")
         right = self.fresh_candidate("right")
+        back = self.fresh_candidate("back")
 
         if front is not None:
             self.front_seen_count = 1
@@ -264,16 +411,16 @@ class MultiCameraObjectMissionNode(Node):
             self.control_front_approach()
             return
 
-        side = self.select_side_candidate(left, right)
-        if side is None:
+        acquisition_source = self.select_acquisition_candidate(left, right, back)
+        if acquisition_source is None:
             self.selected_camera = None
             self.front_seen_count = 0
             self.stop_robot()
-            self.log_debug_state(Twist(), front, left, right)
+            self.log_debug_state(Twist(), front, left, right, back)
             return
 
-        self.selected_camera = side.camera
-        if side.camera == "right":
+        self.selected_camera = acquisition_source.camera
+        if acquisition_source.camera in ("right", "back"):
             self.transition_to(MissionState.TURN_RIGHT_TO_ACQUIRE_FRONT)
             self.control_turn("right")
         else:
@@ -285,6 +432,7 @@ class MultiCameraObjectMissionNode(Node):
         front = self.fresh_candidate("front")
         left = self.fresh_candidate("left")
         right = self.fresh_candidate("right")
+        back = self.fresh_candidate("back")
 
         self.update_front_acquire_count(front)
 
@@ -298,7 +446,10 @@ class MultiCameraObjectMissionNode(Node):
         elapsed = (self.get_clock().now() - self.state_entered_at).nanoseconds / 1e9
         acquire_timeout = float(self.get_parameter("front_acquire_timeout_sec").value)
         if elapsed > acquire_timeout:
-            self.finish("failed: front acquire timeout")
+            self.finish(
+                "failed: front acquire timeout",
+                MissionResultCode.FRONT_ACQUIRE_TIMEOUT,
+            )
             return
 
         turn_speed = float(self.get_parameter("turn_speed").value)
@@ -306,21 +457,22 @@ class MultiCameraObjectMissionNode(Node):
         cmd.linear.x = 0.0
         cmd.angular.z = -turn_speed if direction == "right" else turn_speed
         self.cmd_pub.publish(cmd)
-        self.log_debug_state(cmd, front, left, right)
+        self.log_debug_state(cmd, front, left, right, back)
 
     def control_front_approach(self):
         """Approach the target using only front-camera detections."""
         front = self.fresh_candidate("front")
         left = self.fresh_candidate("left")
         right = self.fresh_candidate("right")
+        back = self.fresh_candidate("back")
 
         if front is None:
             self.front_seen_count = 0
             self.stop_robot()
             if self.front_object_lost():
-                self.finish("failed: front object lost")
+                self.finish("failed: front object lost", MissionResultCode.TARGET_LOST)
                 return
-            self.log_debug_state(Twist(), front, left, right)
+            self.log_debug_state(Twist(), front, left, right, back)
             return
 
         self.last_front_acquire_received_ns = front.received_ns
@@ -332,7 +484,7 @@ class MultiCameraObjectMissionNode(Node):
         object_left = float(front.position.y)
         cmd, control_state = self.compute_approach_cmd(object_forward, object_left)
         self.cmd_pub.publish(cmd)
-        self.log_debug_state(cmd, front, left, right)
+        self.log_debug_state(cmd, front, left, right, back)
 
         if control_state == "arrived":
             self.transition_to(MissionState.ARRIVED)
@@ -340,7 +492,8 @@ class MultiCameraObjectMissionNode(Node):
                 "success: arrived "
                 f"class='{self.target_class_name}' "
                 f"forward={object_forward:.3f} left={object_left:.3f} "
-                f"score={front.score:.3f}"
+                f"score={front.score:.3f}",
+                MissionResultCode.SUCCEEDED,
             )
 
     def compute_approach_cmd(self, object_forward, object_left):
@@ -392,20 +545,21 @@ class MultiCameraObjectMissionNode(Node):
         if candidate is None:
             return None
 
+        if self.goal_started_at is not None and candidate.received_at < self.goal_started_at:
+            return None
+
         age = (self.get_clock().now() - candidate.received_at).nanoseconds / 1e9
         if age > float(self.get_parameter("detection_timeout_sec").value):
             return None
         return candidate
 
-    def select_side_candidate(self, left, right):
-        """Pick the nearer side target, preferring right on near ties."""
-        if left is None:
-            return right
-        if right is None:
-            return left
-        if right.distance <= left.distance + self.RIGHT_TIE_EPSILON_M:
-            return right
-        return left
+    def select_acquisition_candidate(self, left, right, back):
+        """Pick a non-front target source, preferring right turns on near ties."""
+        return select_acquisition_candidate(
+            (left, right, back),
+            ("right", "back", "left"),
+            self.RIGHT_TIE_EPSILON_M,
+        )
 
     def mission_timed_out(self):
         elapsed = (self.get_clock().now() - self.started_at).nanoseconds / 1e9
@@ -431,6 +585,8 @@ class MultiCameraObjectMissionNode(Node):
             self.front_seen_count = 0
             self.last_front_acquire_received_ns = None
         self.get_logger().info(f"state transition: {previous.value} -> {next_state.value}")
+        if self.mission_active:
+            self.publish_status(next_state.value, MissionResultCode.SUCCEEDED, "state transition")
 
     def stop_robot(self):
         """Publish a zero Twist to stop the AMR."""
@@ -438,25 +594,73 @@ class MultiCameraObjectMissionNode(Node):
             return
         self.cmd_pub.publish(Twist())
 
-    def finish(self, message):
-        """End the mission, stop the robot, log the result, and shut down."""
+    def finish(self, message, result_code=None):
+        """End the active mission, stop the robot, publish result, and return idle."""
         if self.done:
             return
-        if message.startswith("failed"):
-            self.transition_to(MissionState.FAILED)
-            self.exit_code = 1
-        else:
+        if result_code is None:
+            result_code = (
+                MissionResultCode.SUCCEEDED
+                if message.startswith("success")
+                else MissionResultCode.MISSION_TIMEOUT
+            )
+
+        if result_code == MissionResultCode.SUCCEEDED:
+            terminal_state = MissionState.ARRIVED
             self.exit_code = 0
+        elif result_code == MissionResultCode.CANCELED:
+            terminal_state = MissionState.CANCELED
+            self.exit_code = 130
+        else:
+            terminal_state = MissionState.FAILED
+            self.exit_code = 1
+
+        if self.state != terminal_state:
+            self.transition_to(terminal_state)
         self.done = True
+        self.mission_active = False
         self.stop_robot()
+        self.last_result = {
+            "state": terminal_state.value,
+            "result_code": result_code.value,
+            "message": message,
+            "target_class_name": self.target_class_name,
+        }
+        self.publish_status(terminal_state.value, result_code, message, terminal=True)
         self.get_logger().info(message)
-        self.shutdown_timer = self.create_timer(0.1, self.force_exit)
+        self.transition_to(MissionState.IDLE)
 
-    def force_exit(self):
-        """Hard exit so the scheduler can observe a finished mission process."""
-        os._exit(self.exit_code)
+    def publish_current_status(self):
+        """Publish periodic state so operators can reliably use topic echo --once."""
+        if self.mission_active:
+            self.publish_status(
+                self.state.value,
+                MissionResultCode.RUNNING,
+                "mission active",
+            )
+            return
 
-    def log_debug_state(self, cmd, front, left, right):
+        self.publish_status(
+            self.state.value,
+            MissionResultCode.IDLE,
+            "mission idle",
+        )
+
+    def publish_status(self, state, result_code, message, terminal=False):
+        """Publish machine-readable mission state for runner/orchestration nodes."""
+        payload = {
+            "state": str(state),
+            "result_code": result_code.value if isinstance(result_code, MissionResultCode) else str(result_code),
+            "message": message,
+            "target_class_name": self.target_class_name,
+            "terminal": bool(terminal),
+            "active": bool(self.mission_active),
+        }
+        msg = String()
+        msg.data = json.dumps(payload, sort_keys=True)
+        self.status_pub.publish(msg)
+
+    def log_debug_state(self, cmd, front, left, right, back):
         """Print compact telemetry every 10 control ticks when debug is enabled."""
         if not bool(self.get_parameter("debug").value):
             return
@@ -472,6 +676,7 @@ class MultiCameraObjectMissionNode(Node):
             f"front_distance={self.format_distance(front)} "
             f"left_distance={self.format_distance(left)} "
             f"right_distance={self.format_distance(right)} "
+            f"back_distance={self.format_distance(back)} "
             f"cmd.linear.x={cmd.linear.x:.3f} "
             f"cmd.angular.z={cmd.angular.z:.3f}"
         )
