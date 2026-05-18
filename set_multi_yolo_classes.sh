@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
-# Set the same YOLO-World class list on all multi-camera yolo_ros instances.
-# Run after launch_three_yolo_world.sh has started the yolo_front/left/right/back nodes.
+# Set the same YOLO-World class list on the active multi-camera yolo_ros instances.
+# Run after launch_three_yolo_world.sh has started the yolo_front/left/right nodes.
 
 set -euo pipefail
 
@@ -25,7 +25,7 @@ for class_name in "${classes[@]}"; do
 done
 json_classes+="]"
 
-for namespace in yolo_front yolo_left yolo_right yolo_back; do
+for namespace in yolo_front yolo_left yolo_right; do
   echo "Setting ${namespace} classes: ${classes[*]}"
   ros2 service call "/${namespace}/set_classes" yolo_msgs/srv/SetClasses \
     "{classes: ${json_classes}}"

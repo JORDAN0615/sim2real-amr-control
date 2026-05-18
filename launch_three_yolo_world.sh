@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# Launch three yolo_ros YOLO-World instances for front/left/right RGB-D cameras.
+# Launch four yolo_ros YOLO-World instances for front/left/right/back RGB-D cameras.
 # Run from inside the Isaac ROS dev workspace/container.
 
 if [[ -f "install/setup.bash" ]]; then
@@ -85,9 +85,15 @@ launch_yolo \
   /right_stereo_camera/depth \
   /right_stereo_camera/left/camera_info
 
+# launch_yolo \
+#   yolo_back \
+#   /back_stereo_camera/left/image_rect_color \
+#   /back_stereo_camera/depth \
+#   /back_stereo_camera/left/camera_info
+
 echo
 echo "All YOLO-World launch processes started."
 echo "Use another terminal to set classes and run multi_camera_object_mission.py."
-echo "Press Ctrl+C here to stop all three yolo_ros instances."
+echo "Press Ctrl+C here to stop all four yolo_ros instances."
 
 wait

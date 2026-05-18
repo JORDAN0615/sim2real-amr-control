@@ -47,6 +47,8 @@ class DemoLoopRunner(Node):
         self.mission_active = False
         self.active_target = None
         self.last_mission_result = None
+        self.active_mission_started = False
+        self.mission_command_sent_at = None
 
         self.log_file = open(args.log_file, "a", encoding="utf-8")
         self.mission_command_pub = self.create_publisher(
@@ -134,10 +136,40 @@ class DemoLoopRunner(Node):
             self.write_log(f"ignored invalid mission status: {msg.data!r}")
             return
 
-        self.mission_active = bool(status.get("active", False))
+        status_active = bool(status.get("active", False))
+        self.mission_active = status_active
+        if self.active_target is not None and status_active:
+            self.active_mission_started = True
+
         if status.get("terminal"):
             self.last_mission_result = status
             self.mission_active = False
+            self.active_mission_started = False
+        elif self.active_target is not None and self.is_completed_status(status, status_active):
+            self.last_mission_result = {
+                "target_class_name": self.active_target.class_name,
+                "result_code": status.get("result_code", "inactive_without_terminal"),
+                "message": status.get(
+                    "message",
+                    "mission became inactive without terminal status",
+                ),
+                "state": status.get("state", "IDLE"),
+                "terminal": True,
+                "active": False,
+            }
+            self.active_mission_started = False
+
+    def is_completed_status(self, status, status_active):
+        """Return true when a mission command appears to have completed."""
+        if status_active:
+            return False
+        if self.active_mission_started:
+            return True
+        if self.mission_command_sent_at is None:
+            return False
+        if time.time() - self.mission_command_sent_at < 1.0:
+            return False
+        return status.get("target_class_name") == self.active_target.class_name
 
     def on_detections(self, camera, msg):
         """Cache latest visible detections from one camera topic."""
@@ -273,7 +305,9 @@ class DemoLoopRunner(Node):
         )
         self.active_target = target
         self.last_mission_result = None
+        self.active_mission_started = False
         self.mission_active = True
+        self.mission_command_sent_at = time.time()
 
         msg = String()
         msg.data = json.dumps(command, sort_keys=True)
@@ -289,6 +323,7 @@ class DemoLoopRunner(Node):
                     f"message={result.get('message')!r}"
                 )
                 self.active_target = None
+                self.mission_command_sent_at = None
                 return result
             time.sleep(self.args.poll_interval_sec)
 
@@ -343,7 +378,7 @@ def build_parser():
     parser.add_argument("--visible-detection-timeout-sec", type=float, default=8.0)
     parser.add_argument("--poll-interval-sec", type=float, default=2.0)
     parser.add_argument("--pause-between-missions-sec", type=float, default=30.0)
-    parser.add_argument("--target-cooldown-sec", type=float, default=0.0)
+    parser.add_argument("--target-cooldown-sec", type=float, default=60.0)
     parser.add_argument("--pause-flag-file", default="/tmp/demo_loop_pause")
     parser.add_argument("--mission-command-topic", default="/multi_camera_object_mission/command")
     parser.add_argument("--mission-cancel-topic", default="/multi_camera_object_mission/cancel")
