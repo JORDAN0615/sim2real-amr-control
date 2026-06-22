@@ -12,8 +12,6 @@ setup(
         "demo_loop_runner",
         "mission_logic",
         "multi_camera_object_mission",
-        "ros2_move_to_object",
-        "ros2_move_to_tag",
     ],
     data_files=[
         ("share/ament_index/resource_index/packages", [f"resource/{package_name}"]),
@@ -31,8 +29,6 @@ setup(
         "console_scripts": [
             "demo_loop_runner = demo_loop_runner:main",
             "multi_camera_object_mission = multi_camera_object_mission:main",
-            "ros2_move_to_object = ros2_move_to_object:main",
-            "ros2_move_to_tag = ros2_move_to_tag:main",
         ],
     },
 )

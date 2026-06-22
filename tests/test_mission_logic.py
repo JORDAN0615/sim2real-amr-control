@@ -17,7 +17,12 @@ class Candidate:
 
 class MissionLogicTest(unittest.TestCase):
     def test_parse_targets_falls_back_to_defaults(self):
-        self.assertEqual(parse_targets(""), ["person", "traffic cone", "grey barrel", "blue barrel"])
+        self.assertEqual(
+            parse_targets("")[:4],
+            ["person", "traffic cone", "grey barrel", "blue barrel"],
+        )
+        self.assertIn("box", parse_targets(""))
+        self.assertIn("Ladder", parse_targets(""))
 
     def test_select_priority_target_skips_cooling_target(self):
         visible = {

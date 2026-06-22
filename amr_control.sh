@@ -12,6 +12,7 @@ MISSION_CANCEL_TOPIC="${AMR_MISSION_CANCEL_TOPIC:-/multi_camera_object_mission/c
 MISSION_STATUS_TOPIC="${AMR_MISSION_STATUS_TOPIC:-/multi_camera_object_mission/status}"
 CMD_VEL_TOPIC="${AMR_CMD_VEL_TOPIC:-/cmd_vel}"
 ECHO_TIMEOUT_SEC="${AMR_ECHO_TIMEOUT_SEC:-5}"
+GO_CONFIRM_TIMEOUT_SEC="${AMR_GO_CONFIRM_TIMEOUT_SEC:-8}"
 
 DETECTION_TOPICS=(
   "/yolo_front/detections_3d"
@@ -27,7 +28,7 @@ Usage:
   ./amr_control.sh resume
   ./amr_control.sh status
   ./amr_control.sh visible
-  ./amr_control.sh go <person|traffic_cone|grey_barrel|blue_barrel|cardboard_box>
+  ./amr_control.sh go <person|traffic_cone|fire_extinguisher|grey_barrel|blue_barrel|cardboard_box|box|cart|ladder>
   ./amr_control.sh processes
 
 Notes:
@@ -53,12 +54,16 @@ normalize_target() {
   case "$target" in
     person) echo "person" ;;
     traffic_cone) echo "traffic cone" ;;
+    fire_extinguisher) echo "fire extinguisher" ;;
     grey_barrel|gray_barrel) echo "grey barrel" ;;
     blue_barrel) echo "blue barrel" ;;
     cardboard_box) echo "cardboard box" ;;
+    box) echo "box" ;;
+    cart|Cart) echo "Cart" ;;
+    ladder|Ladder) echo "Ladder" ;;
     *)
       echo "Unknown target: $*" >&2
-      echo "Allowed: person, traffic_cone, grey_barrel, blue_barrel, cardboard_box" >&2
+      echo "Allowed: person, traffic_cone, fire_extinguisher, grey_barrel, blue_barrel, cardboard_box, box, cart, ladder" >&2
       exit 2
       ;;
   esac
@@ -84,6 +89,27 @@ resume_loop() {
 
 show_status() {
   timeout "$ECHO_TIMEOUT_SEC" ros2 topic echo "$MISSION_STATUS_TOPIC" --once
+}
+
+read_status_once() {
+  timeout "$ECHO_TIMEOUT_SEC" ros2 topic echo "$MISSION_STATUS_TOPIC" --once 2>/dev/null || true
+}
+
+wait_for_target_status() {
+  local target_class_name="$1"
+  local deadline=$((SECONDS + GO_CONFIRM_TIMEOUT_SEC))
+  local status
+
+  while (( SECONDS < deadline )); do
+    status="$(read_status_once)"
+    if printf '%s\n' "$status" | grep -F "\"target_class_name\": \"${target_class_name}\"" >/dev/null; then
+      printf '%s\n' "$status"
+      return 0
+    fi
+    sleep 1
+  done
+
+  return 1
 }
 
 show_visible() {
@@ -121,7 +147,10 @@ send_target() {
     "{data: '${target_class_name}'}"
   echo "sent target=${target_class_name}"
   echo "status:"
-  show_status || true
+  if ! wait_for_target_status "$target_class_name"; then
+    echo "target_status_not_confirmed target=${target_class_name}"
+    show_status || true
+  fi
 }
 
 show_processes() {

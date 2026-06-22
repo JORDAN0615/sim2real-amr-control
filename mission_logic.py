@@ -9,6 +9,12 @@ DEFAULT_PRIORITY_TARGETS = [
     "traffic cone",
     "grey barrel",
     "blue barrel",
+    "cardboard box",
+    "fire extinguisher",
+    "forklift",
+    "box",
+    "Cart",
+    "Ladder",
 ]
 
 
